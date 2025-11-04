@@ -1,0 +1,79 @@
+// Valid codes - in production use env vars or a database
+private static final Set<String> VALID_CODES = Set.of("theabc's");
+
+private static final String PORTAL_COOKIE = "portal_access";
+
+@PostMapping("/check-code")
+public ResponseEntity<?> checkCode(@RequestBody Map<String, String> body, HttpServletResponse response) {
+    String code = body.getOrDefault("code", "");
+    if (code == null || code.isBlank()) {
+        return ResponseEntity.badRequest().body(Map.of("ok", false, "message", "No code provided"));
+    }
+    if (VALID_CODES.contains(code)) {
+        Cookie cookie = new Cookie(PORTAL_COOKIE, "1");
+        cookie.setPath("/");
+        cookie.setHttpOnly(true);
+        cookie.setMaxAge(30 * 60); // 30 minutes
+        // cookie.setSecure(true); // enable in production with HTTPS
+        response.addCookie(cookie);
+        return ResponseEntity.ok(Map.of("ok", true, "redirect", "/portal.html"));
+    } else {
+        return ResponseEntity.status(401).body(Map.of("ok", false, "message", "Invalid code"));
+    }
+}
+@Value("${UNBLOCK_TOKEN:}")
+private String unblockToken;
+
+private static final String PORTAL_COOKIE = "portal_access";
+
+private static final int MAX_ATTEMPTS = 5;
+private static final long WINDOW_MS = 60_000;
+private final ConcurrentHashMap<String, Attempts> attemptsByIp = new ConcurrentHashMap<>();
+
+private static class Attempts {
+    final int count;
+    final long windowStart;
+    Attempts(int c, long w) { this.count = c; this.windowStart = w; }
+}
+
+private boolean isRateLimited(String ip) {
+    long now = Instant.now().toEpochMilli();
+    attemptsByIp.compute(ip, (k, old) -> {
+        if (old == null || now - old.windowStart > WINDOW_MS) {
+            return new Attempts(1, now);
+        } else {
+            return new Attempts(old.count + 1, old.windowStart);
+        }
+    });
+    Attempts curr = attemptsByIp.get(ip);
+    return curr != null && curr.count > MAX_ATTEMPTS;
+}
+
+@PostMapping("/unblock")
+public ResponseEntity<?> unblock(@RequestBody Map<String, String> body,
+                                 @RequestHeader(value = "X-Forwarded-For", required = false) String xff,
+                                 HttpServletResponse response) {
+    String ip = (xff != null && !xff.isEmpty()) ? xff.split(",")[0].trim() : "unknown";
+    if (isRateLimited(ip)) {
+        System.out.println("UNBLOCK rate-limited from IP: " + ip);
+        return ResponseEntity.status(429).body(Map.of("ok", false, "message", "Too many attempts. Try again later."));
+    }
+    if (unblockToken == null || unblockToken.isEmpty()) {
+        System.out.println("UNBLOCK attempted but UNBLOCK_TOKEN is not configured on server");
+        return ResponseEntity.status(503).body(Map.of("ok", false, "message", "Unblock not configured"));
+    }
+    String token = body.getOrDefault("token", "");
+    if (token.equals(unblockToken)) {
+        Cookie cookie = new Cookie(PORTAL_COOKIE, "1");
+        cookie.setHttpOnly(true);
+        cookie.setPath("/");
+        cookie.setMaxAge(30 * 60);
+        // cookie.setSecure(true); // enable in production with HTTPS
+        response.addCookie(cookie);
+        System.out.println("UNBLOCK success for IP: " + ip + " at " + Instant.now());
+        return ResponseEntity.ok(Map.of("ok", true, "message", "Unblocked"));
+    } else {
+        System.out.println("UNBLOCK failed token attempt from IP: " + ip + " at " + Instant.now());
+        return ResponseEntity.status(401).body(Map.of("ok", false, "message", "Invalid token"));
+    }
+}
