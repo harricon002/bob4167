@@ -1,0 +1,212 @@
+-- Config: store codes, admin userIds, and unblock token (change these)
+-- Keep this ModuleScript server-side only (ServerScriptService).
+local Config = {}
+
+-- Valid access codes (server-side)
+Config.VALID_CODES = {
+    ["theabc's"] = true,
+    -- add more as needed: ["ANOTHERCODE"] = true,
+}
+
+-- Admins who may use unblock commands without token (replace with your UserId(s))
+Config.ADMINS = {
+    [12345678] = true, -- replace with your Roblox userId
+    -- [87654321] = true,
+}
+
+-- Secret token (server-side). Change this to a strong value and DO NOT share publicly.
+Config.UNBLOCK_TOKEN = "change_this_to_a_secret_token"
+
+-- Rate limiter settings for unblock attempts (per caller)
+Config.UNBLOCK_MAX_ATTEMPTS = 5
+Config.UNBLOCK_WINDOW_SECONDS = 60
+
+-- DataStore persistence toggle (optional)
+Config.USE_DATASTORE = false
+Config.DATASTORE_NAME = "GamePortalAccess"
+
+return Config -- Server-side: validates codes, grants access, handles admin unblock and error reports.
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local ServerScriptService = game:GetService("ServerScriptService")
+local DataStoreService = game:GetService("DataStoreService")
+
+local config = require(ServerScriptService:WaitForChild("Config"))
+
+-- Create or get RemoteFunction / RemoteEvents in ReplicatedStorage
+local function getOrCreate(name, className)
+    local obj = ReplicatedStorage:FindFirstChild(name)
+    if obj then return obj end
+    local newObj = Instance.new(className)
+    newObj.Name = name
+    newObj.Parent = ReplicatedStorage
+    return newObj
+end
+
+local CheckCode = getOrCreate("CheckCode", "RemoteFunction")       -- RemoteFunction: client invokes with code -> returns table {ok=bool, message=string}
+local AdminUnblock = getOrCreate("AdminUnblock", "RemoteFunction")-- RemoteFunction: admin invokes with {targetUserId=number, token=string} -> returns {ok=bool, message}
+local ReportError = getOrCreate("ReportError", "RemoteEvent")     -- RemoteEvent: client fires an error report
+local ServerMessage = getOrCreate("ServerMessage", "RemoteEvent") -- RemoteEvent: server -> client messages (for notifications)
+
+local accessStore
+if config.USE_DATASTORE then
+    accessStore = DataStoreService:GetDataStore(config.DATASTORE_NAME)
+end
+
+-- Simple in-memory rate limiter for unblock attempts per caller UserId
+local unblockAttempts = {} -- [callerUserId] = {count = n, windowStart = os.time()}
+
+local function isRateLimited(callerUserId)
+    local now = os.time()
+    local rec = unblockAttempts[callerUserId]
+    if not rec or now - rec.windowStart > config.UNBLOCK_WINDOW_SECONDS then
+        unblockAttempts[callerUserId] = { count = 1, windowStart = now }
+        return false
+    else
+        rec.count = rec.count + 1
+        return rec.count > config.UNBLOCK_MAX_ATTEMPTS
+    end
+end
+
+local function setPlayerAccess(player, value)
+    -- Use Attributes (safer than creating values)
+    player:SetAttribute("HasAccess", value and true or false)
+    -- optional persistence
+    if config.USE_DATASTORE and value then
+        local key = "access_" .. tostring(player.UserId)
+        local ok, err = pcall(function()
+            accessStore:SetAsync(key, true)
+        end)
+        if not ok then
+            warn("DataStore SetAsync failed:", err)
+        end
+    end
+end
+
+local function playerHasAccess(player)
+    local attr = player:GetAttribute("HasAccess")
+    if attr ~= nil then return attr end
+    if config.USE_DATASTORE then
+        local key = "access_" .. tostring(player.UserId)
+        local ok, res = pcall(function() return accessStore:GetAsync(key) end)
+        if ok and res then
+            player:SetAttribute("HasAccess", true)
+            return true
+        end
+    end
+    return false
+end
+
+-- Server invoke to check code
+CheckCode.OnServerInvoke = function(player, code)
+    if not code or type(code) ~= "string" then
+        return { ok = false, message = "No code provided." }
+    end
+    if config.VALID_CODES[code] then
+        setPlayerAccess(player, true)
+        print(("Player %s (%d) passed code check"):format(player.Name, player.UserId))
+        return { ok = true, message = "Access granted." }
+    else
+        print(("Player %s (%d) provided invalid code"):format(player.Name, player.UserId))
+        return { ok = false, message = "Invalid code." }
+    end
+end
+
+-- Admin unblock function (caller must be admin or present correct token)
+AdminUnblock.OnServerInvoke = function(caller, params)
+    -- params = { targetUserId = number, token = string }
+    local targetUserId = params and tonumber(params.targetUserId)
+    local token = params and tostring(params.token or "")
+
+    if isRateLimited(caller.UserId) then
+        return { ok = false, message = "Too many unblock attempts. Try again later." }
+    end
+
+    local callerIsAdmin = config.ADMINS[caller.UserId] == true
+    local tokenOk = (#token > 0 and token == config.UNBLOCK_TOKEN)
+
+    if not (callerIsAdmin or tokenOk) then
+        warn(("UNBLOCK attempt denied: caller %s (%d)"):format(caller.Name, caller.UserId))
+        return { ok = false, message = "Unauthorized." }
+    end
+
+    if not targetUserId then
+        return { ok = false, message = "Invalid target user id." }
+    end
+
+    local targetPlayer = Players:GetPlayerByUserId(targetUserId)
+    if not targetPlayer then
+        return { ok = false, message = "Target player not in server." }
+    end
+
+    setPlayerAccess(targetPlayer, true)
+    print(("UNBLOCK success: caller %s (%d) unblocked %s (%d)"):format(caller.Name, caller.UserId, targetPlayer.Name, targetPlayer.UserId))
+
+    -- Notify both
+    ServerMessage:FireClient(targetPlayer, "You were granted access by an admin.")
+    ServerMessage:FireClient(caller, ("Unblocked %s"):format(targetPlayer.Name))
+
+    return { ok = true, message = ("Unblocked %s"):format(targetPlayer.Name) }
+end
+
+-- Handle client error reports
+ReportError.OnServerEvent:Connect(function(player, reportTable)
+    -- reportTable expected to be a table with fields { message = "...", stack = "...", extra = {...} }
+    if type(reportTable) ~= "table" then
+        warn("Malformed error report from", player.Name)
+        return
+    end
+    print("Client error report from", player.Name, player.UserId, ":", reportTable)
+    -- Optionally write to DataStore or external logging service here
+end)
+
+-- Optionally expose a simple chat command handler for admins if you want alternative UX
+Players.PlayerAdded:Connect(function(player)
+    -- restore persisted access (if using DataStore)
+    if config.USE_DATASTORE then
+        local key = "access_" .. tostring(player.UserId)
+        local ok, res = pcall(function() return accessStore:GetAsync(key) end)
+        if ok and res then
+            player:SetAttribute("HasAccess", true)
+        end
+    end
+
+    player.Chatted:Connect(function(msg)
+        -- simple chat command format: /unblock <targetUserId> <token?>
+        local lower = string.lower(msg or "")
+        if string.sub(lower,1,8) == "/unblock" then
+            local parts = {}
+            for part in string.gmatch(msg, "%S+") do table.insert(parts, part) end
+            -- parts[1] = "/unblock", parts[2] = targetUserId, parts[3] = token (optional)
+            local targetId = tonumber(parts[2])
+            local token = parts[3] or ""
+            local result = AdminUnblock:InvokeServer -- not used; we implement in server directly
+            -- We'll reuse same logic as AdminUnblock.OnServerInvoke: perform check here
+            if isRateLimited(player.UserId) then
+                ServerMessage:FireClient(player, "Too many unblock attempts. Try again later.")
+                return
+            end
+            local callerIsAdmin = config.ADMINS[player.UserId] == true
+            local tokenOk = (token ~= "" and token == config.UNBLOCK_TOKEN)
+            if not (callerIsAdmin or tokenOk) then
+                ServerMessage:FireClient(player, "Unauthorized to unblock.")
+                return
+            end
+            if not targetId then
+                ServerMessage:FireClient(player, "Invalid target id.")
+                return
+            end
+            local target = Players:GetPlayerByUserId(targetId)
+            if not target then
+                ServerMessage:FireClient(player, "Target player not found.")
+                return
+            end
+            setPlayerAccess(target, true)
+            ServerMessage:FireClient(player, ("Unblocked %s."):format(target.Name))
+            ServerMessage:FireClient(target, "You were granted access by an admin.")
+        end
+    end)
+end)
+
+-- Debug print
+print("CodeServer initialized. Valid codes count:", (function() local c=0; for _ in pairs(config.VALID_CODES) do c=c+1 end; return c end)())
